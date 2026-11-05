@@ -63,7 +63,8 @@ test('live reporting records progress, answers, score, duration, events and CSV'
 test('ban and admin stop preserve history and prevent later answer changes',async()=>{
  const {sql,call}=fixture();try{
   const login=await call('register',{firstName:'Анна',lastName:'Соколова'}),cookie=login.cookie;
-  await call('start',{},cookie);await call('answer',{index:0,answer:0},cookie);await call('ban',{reason:'Свернул окно'},cookie);
+  await call('start',{},cookie);await call('answer',{index:0,answer:0},cookie);
+  for(let i=0;i<4;i++){sql.prepare('UPDATE invites SET last_violation_at=NULL').run();await call('violation',{reason:'Свернул окно',eventId:crypto.randomUUID()},cookie)}
   assert.equal((await call('state',{},cookie)).status,423);assert.equal((await call('answer',{index:0,answer:1},cookie)).status,423);
   const r=(await call('admin/list',{status:'banned'},'',true)).body.rows[0];
   assert.equal(r.reason,'Свернул окно');assert.equal(r.answers[0],0);assert.ok(r.finished_at);
@@ -72,5 +73,60 @@ test('ban and admin stop preserve history and prevent later answer changes',asyn
   const id=(await call('admin/list',{},'',true)).body.rows[0].id;
   await call('admin/revoke',{id},'',true);assert.equal((await call('state',{},l2.cookie,false,'browser-2')).status,423);
   assert.ok((await call('admin/report',{id},'',true)).body.events.some(e=>e.kind==='admin_ban'));
+ }finally{sql.close()}
+});
+
+test('three warnings then ban; duplicate and simultaneous browser events count once',async()=>{
+ const {sql,call}=fixture();try{
+  const login=await call('register',{firstName:'Проверка',lastName:'Предупреждений'}),cookie=login.cookie;
+  await call('start',{},cookie);
+  const eventId=crypto.randomUUID();
+  const first=await call('violation',{reason:'Потеря фокуса',eventId},cookie);
+  assert.equal(first.body.warnings,1);assert.equal(first.body.banned,false);
+  assert.equal((await call('violation',{reason:'Повтор',eventId},cookie)).body.warnings,1);
+  assert.equal((await call('violation',{reason:'visibilitychange',eventId:crypto.randomUUID()},cookie)).body.warnings,1);
+  for(let n=2;n<=3;n++){
+   sql.prepare('UPDATE invites SET last_violation_at=NULL').run();
+   const warning=await call('violation',{eventId:crypto.randomUUID(),reason:'Уход из окна'},cookie);
+   assert.equal(warning.body.warnings,n);assert.equal(warning.body.banned,false);
+   assert.equal((await call('state',{},cookie)).body.warnings,n);
+   assert.equal((await call('answer',{index:0,answer:1},cookie)).status,200);
+  }
+  sql.prepare('UPDATE invites SET last_violation_at=NULL').run();
+  assert.equal((await call('violation',{eventId,reason:'Старый повтор'},cookie)).body.warnings,3);
+  assert.equal((await call('state',{},cookie)).body.status,'active');
+  const final=await call('violation',{eventId:crypto.randomUUID(),reason:'Четвёртое нарушение'},cookie);
+  assert.equal(final.body.banned,true);assert.equal(final.body.warnings,3);
+  assert.equal((await call('state',{},cookie)).status,423);
+  assert.equal(sql.prepare("SELECT count(*) AS n FROM attempt_events WHERE kind='warning'").get().n,3);
+  assert.equal(sql.prepare("SELECT count(*) AS n FROM attempt_events WHERE kind='banned'").get().n,1);
+ }finally{sql.close()}
+});
+
+test('editable question counts, version conflicts and frozen attempts',async()=>{
+ const {sql,call}=fixture();try{
+  const config=(await call('admin/questions',{},'',true)).body;assert.equal(config.questions.length,5);
+  assert.equal((await call('admin/questions/save',{revision:config.revision,questions:[]})).status,403);
+  assert.equal((await call('admin/questions/save',{revision:config.revision,questions:[]},'',true)).status,400);
+  const questions=[{q:'Первый новый вопрос?',o:['a','b','c','d'],a:2},{q:'Второй новый вопрос?',o:['e','f','g','h'],a:3}];
+  const saved=await call('admin/questions/save',{revision:config.revision,questions},'',true);assert.equal(saved.status,200);assert.equal(saved.body.count,2);
+  assert.equal((await call('admin/questions/save',{revision:config.revision,questions},'',true)).status,409);
+  const login=await call('register',{firstName:'Первый',lastName:'Участник'}),cookie=login.cookie;
+  assert.equal((await call('state',{},cookie)).body.questionCount,2);
+  await call('start',{},cookie);
+  assert.equal((await call('state',{},cookie)).body.questions[0].a,undefined);
+  const newQuestion=[{q:'Только один вопрос',o:['1','2','3','4'],a:0}];
+  await call('admin/questions/save',{revision:saved.body.revision,questions:newQuestion},'',true);
+  const active=(await call('state',{},cookie)).body;assert.equal(active.questionCount,2);assert.equal(active.questions[0].q,'Первый новый вопрос?');
+  await call('answer',{index:0,answer:2},cookie);await call('answer',{index:1,answer:3},cookie);
+  assert.equal((await call('answer',{index:2,answer:0},cookie)).status,400);
+  assert.equal((await call('finish',{},cookie)).body.score,2);
+  const id=(await call('admin/list',{search:'Первый'},'',true)).body.rows[0].id;
+  const report=(await call('admin/report',{id},'',true)).body;assert.equal(report.questions.length,2);assert.equal(report.questions[0].correct,true);assert.equal(report.participant.question_count,2);
+  const login2=await call('register',{firstName:'Второй',lastName:'Участник'},'',false,'browser-2');
+  await call('start',{},login2.cookie,false,'browser-2');
+  const s2=(await call('state',{},login2.cookie,false,'browser-2')).body;assert.equal(s2.questionCount,1);assert.equal(s2.questions[0].q,newQuestion[0].q);
+  await call('answer',{index:0,answer:0},login2.cookie,false,'browser-2');assert.equal((await call('finish',{},login2.cookie,false,'browser-2')).body.score,1);
+  const csv=(await call('admin/export',{},'',true)).body;assert.match(csv,/Первый новый вопрос/);assert.match(csv,/Только один вопрос/);assert.match(csv,/Всего вопросов/);assert.match(csv,/Предупреждений/);
  }finally{sql.close()}
 });

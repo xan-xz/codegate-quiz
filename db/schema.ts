@@ -21,6 +21,10 @@ export const invites = sqliteTable('invites', {
   lastSeenAt: integer('last_seen_at'),
   currentQuestion: integer('current_question').notNull().default(0),
   userAgent: text('user_agent'),
+  questionSnapshot: text('question_snapshot'),
+  violationCount: integer('violation_count').notNull().default(0),
+  lastViolationId: text('last_violation_id'),
+  lastViolationAt: integer('last_violation_at'),
 }, table => [index('invites_browser_index').on(table.browser)]);
 
 export const attemptEvents = sqliteTable('attempt_events', {
@@ -29,10 +33,18 @@ export const attemptEvents = sqliteTable('attempt_events', {
   kind: text('kind').notNull(),
   detail: text('detail').notNull().default('{}'),
   createdAt: integer('created_at').notNull(),
+  eventKey: text('event_key').unique(),
 }, table => [index('attempt_events_participant_index').on(table.inviteId, table.id)]);
 
 export const rateLimits = sqliteTable('rate_limits', {
   key: text('key').primaryKey(),
   count: integer('count').notNull().default(0),
   expires: integer('expires').notNull(),
+});
+
+export const quizSettings = sqliteTable('quiz_settings', {
+  id: text('id').primaryKey(),
+  questions: text('questions').notNull(),
+  revision: integer('revision').notNull().default(1),
+  updatedAt: integer('updated_at').notNull(),
 });

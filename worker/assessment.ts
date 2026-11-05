@@ -1,14 +1,16 @@
 import html from './assessment.html?raw';
 
-type Attempt={id:number;label:string;status:string;browser:string;reason:string|null;answers:string;score:number|null;first_name:string|null;last_name:string|null;joined_at:number|null;started_at:number|null;finished_at:number|null;last_seen_at:number|null;current_question:number;user_agent:string|null;created:string};
-const questions=[
+type Question={q:string;o:string[];a:number};
+type Attempt={id:number;label:string;status:string;browser:string;reason:string|null;answers:string;score:number|null;first_name:string|null;last_name:string|null;joined_at:number|null;started_at:number|null;finished_at:number|null;last_seen_at:number|null;current_question:number;user_agent:string|null;created:string;question_snapshot:string|null;violation_count:number;last_violation_id:string|null;last_violation_at:number|null};
+const WARNING_LIMIT=3;
+const defaultQuestions:Question[]=[
   {q:'Какое значение вернёт 2 + 3 * 4?',o:['20','14','24','9'],a:1},
   {q:'Какой тип данных хранит true и false?',o:['String','Number','Boolean','Array'],a:2},
   {q:'Что делает цикл?',o:['Повторяет инструкции','Удаляет программу','Создаёт базу данных','Шифрует файл'],a:0},
   {q:'Что вернёт JavaScript: typeof "hello"?',o:['text','String','string','object'],a:2},
   {q:'Для чего нужен Git?',o:['Для рисования','Для контроля версий кода','Для запуска SQL','Для создания паролей'],a:1},
 ];
-const columns='id,label,status,reason,answers,score,created,first_name,last_name,joined_at,started_at,finished_at,last_seen_at,current_question,user_agent';
+const columns='id,label,status,reason,answers,score,created,first_name,last_name,joined_at,started_at,finished_at,last_seen_at,current_question,user_agent,question_snapshot,violation_count,last_violation_id,last_violation_at';
 const headers={'Cache-Control':'no-store','X-Content-Type-Options':'nosniff','Referrer-Policy':'no-referrer','X-Frame-Options':'DENY'};
 const send=(status:number,value:unknown,extra:Record<string,string>={})=>Response.json(value,{status,headers:{...headers,...extra}});
 const random=(size:number)=>Array.from(crypto.getRandomValues(new Uint8Array(size)),n=>n.toString(16).padStart(2,'0')).join('');
@@ -16,7 +18,15 @@ async function hash(s:string){return Array.from(new Uint8Array(await crypto.subt
 async function safe(a:string,b:string){const [x,y]=await Promise.all([hash(a),hash(b)]);let d=0;for(let i=0;i<x.length;i++)d|=x.charCodeAt(i)^y.charCodeAt(i);return d===0;}
 const cleanName=(s:unknown)=>typeof s==='string'?s.normalize('NFKC').trim().replace(/\s+/g,' '):'';
 const validName=(s:string)=>s.length>=1&&s.length<=60&&/^[\p{L}\p{M}][\p{L}\p{M}'’ .-]*$/u.test(s);
-function summary(row:Attempt){const answers=JSON.parse(row.answers);return {...row,answers,answered:Object.keys(answers).length,duration_ms:row.started_at?Math.max(0,(row.finished_at||Date.now())-row.started_at):null};}
+const questionsFor=(row:Attempt,readyQuestions=defaultQuestions):Question[]=>row.question_snapshot?JSON.parse(row.question_snapshot):row.status==='ready'?readyQuestions:defaultQuestions;
+function summary(row:Attempt,readyQuestions=defaultQuestions){const answers=JSON.parse(row.answers);const {question_snapshot,...publicRow}=row;return {...publicRow,answers,question_count:questionsFor(row,readyQuestions).length,warnings:Math.min(row.violation_count,WARNING_LIMIT),answered:Object.keys(answers).length,duration_ms:row.started_at?Math.max(0,(row.finished_at||Date.now())-row.started_at):null};}
+async function settings(db:D1DatabaseSession){const row=await db.prepare("SELECT questions,revision FROM quiz_settings WHERE id='main'").first<{questions:string;revision:number}>();return {questions:row?JSON.parse(row.questions) as Question[]:defaultQuestions,revision:row?.revision||0};}
+function validateQuestions(value:unknown):Question[]|null{
+  if(!Array.isArray(value)||value.length<1||value.length>100)return null;
+  const normalized:Question[]=[];
+  for(const item of value){if(!item||typeof item.q!=='string'||!item.q.trim()||item.q.trim().length>1000||!Array.isArray(item.o)||item.o.length!==4||!item.o.every((o:unknown)=>typeof o==='string'&&o.trim().length>0&&o.trim().length<=500)||!Number.isInteger(item.a)||item.a<0||item.a>3)return null;normalized.push({q:item.q.trim(),o:item.o.map((o:string)=>o.trim()),a:item.a})}
+  return normalized;
+}
 function csvCell(value:unknown){let s=String(value??'');if(/^[=+\-@\t\r]/.test(s))s="'"+s;return '"'+s.replaceAll('"','""')+'"';}
 
 export async function handleQuiz(request:Request,env:Cloudflare.Env):Promise<Response>{
@@ -32,7 +42,8 @@ export async function handleQuiz(request:Request,env:Cloudflare.Env):Promise<Res
   let b:Record<string,unknown>;
   try{
     const reader=request.body?.getReader(),chunks:Uint8Array[]=[];let size=0;
-    if(reader)for(;;){const {done,value}=await reader.read();if(done)break;size+=value.length;if(size>8192){await reader.cancel();return send(413,{error:'Слишком большой запрос'})}chunks.push(value)}
+    const maxBody=path==='/api/admin/questions/save'?524288:8192;
+    if(reader)for(;;){const {done,value}=await reader.read();if(done)break;size+=value.length;if(size>maxBody){await reader.cancel();return send(413,{error:'Слишком большой запрос'})}chunks.push(value)}
     const bytes=new Uint8Array(size);let offset=0;for(const c of chunks){bytes.set(c,offset);offset+=c.length}
     b=JSON.parse(new TextDecoder().decode(bytes)||'{}');if(!b||Array.isArray(b)||typeof b!=='object')throw Error();
   }catch{return send(400,{error:'Некорректный запрос'})}
@@ -47,12 +58,22 @@ export async function handleQuiz(request:Request,env:Cloudflare.Env):Promise<Res
     }
     if(path.startsWith('/api/admin/')){
       if(!await safe(request.headers.get('X-Admin-Key')||'',env.ADMIN_KEY))return send(403,{error:'Неверный ключ администратора'});
+      if(path==='/api/admin/questions')return send(200,await settings(db));
+      if(path==='/api/admin/questions/save'){
+        const questions=validateQuestions(b.questions);
+        if(!questions)return send(400,{error:'Нужно от 1 до 100 вопросов. У каждого — текст, 4 непустых варианта и один правильный ответ.'});
+        const current=await settings(db);
+        if(!Number.isSafeInteger(b.revision)||b.revision!==current.revision)return send(409,{error:'Вопросы уже изменились. Обновите редактор и повторите изменения.'});
+        const saved=await db.prepare("INSERT INTO quiz_settings(id,questions,revision,updated_at) VALUES('main',?,1,?) ON CONFLICT(id) DO UPDATE SET questions=excluded.questions,revision=quiz_settings.revision+1,updated_at=excluded.updated_at WHERE quiz_settings.revision=? RETURNING revision").bind(JSON.stringify(questions),now,b.revision).first<{revision:number}>();
+        return saved?send(200,{ok:true,revision:saved.revision,count:questions.length}):send(409,{error:'Вопросы уже изменились. Обновите редактор.'});
+      }
       if(path==='/api/admin/list'){
         const search=String(b.search||'').slice(0,120).toLocaleLowerCase('ru');
         const status=['ready','active','done','banned','new'].includes(String(b.status))?String(b.status):'';
         const before=Number.isSafeInteger(b.before)&&Number(b.before)>0?Number(b.before):Number.MAX_SAFE_INTEGER;
         const result=await db.prepare(`SELECT ${columns} FROM invites WHERE id<? AND (?='' OR instr(coalesce(search_name,lower(label)),?)>0 OR instr(label,?)>0) AND (?='' OR status=?) ORDER BY id DESC LIMIT 51`).bind(before,search,search,String(b.search||'').trim().slice(0,120),status,status).all<Attempt>();
-        const rows=result.results.slice(0,50).map(summary);
+        const current=await settings(db);
+        const rows=result.results.slice(0,50).map(r=>summary(r,current.questions));
         const stats=await db.prepare("SELECT count(*) AS total,sum(status='active') AS active,sum(status='ready') AS ready,sum(status='done') AS done,sum(status='banned') AS banned,round(avg(CASE WHEN status='done' THEN score END),2) AS average FROM invites WHERE status!='new'").first();
         return send(200,{rows,stats,next:result.results.length>50?rows.at(-1)?.id:null,server_time:now});
       }
@@ -62,7 +83,8 @@ export async function handleQuiz(request:Request,env:Cloudflare.Env):Promise<Res
         if(!row)return send(404,{error:'Участник не найден'});
         const events=await db.prepare('SELECT id,kind,detail,created_at FROM attempt_events WHERE invite_id=? ORDER BY id DESC LIMIT 501').bind(b.id).all<{id:number;kind:string;detail:string;created_at:number}>();
         const answers=JSON.parse(row.answers);
-        return send(200,{participant:summary(row),questions:questions.map((q,i)=>({...q,index:i,selected:answers[i]??null,correct:answers[i]===undefined?null:answers[i]===q.a})),events:events.results.slice(0,500).map(e=>({...e,detail:JSON.parse(e.detail)})),events_truncated:events.results.length>500,server_time:now});
+        const questions=questionsFor(row,(await settings(db)).questions);
+        return send(200,{participant:summary(row,questions),questions:questions.map((q,i)=>({...q,index:i,selected:answers[i]??null,correct:answers[i]===undefined?null:answers[i]===q.a})),events:events.results.slice(0,500).map(e=>({...e,detail:JSON.parse(e.detail)})),events_truncated:events.results.length>500,server_time:now});
       }
       if(path==='/api/admin/revoke'){
         if(!Number.isSafeInteger(b.id))return send(400,{error:'Некорректный участник'});
@@ -74,9 +96,10 @@ export async function handleQuiz(request:Request,env:Cloudflare.Env):Promise<Res
       }
       if(path==='/api/admin/export'){
         const rows=await db.prepare(`SELECT ${columns} FROM invites ORDER BY id DESC`).all<Attempt>();
-        const head=['ID','Имя','Фамилия','Имя в отчёте','Статус','Ответов','Баллы из 5','Регистрация UTC','Начало UTC','Окончание UTC','Последняя связь UTC','Время в секундах','Текущий вопрос','Причина',...questions.flatMap((_,i)=>[`Вопрос ${i+1}: ответ`,`Вопрос ${i+1}: верно`])];
+        const current=await settings(db),maxQuestions=Math.max(current.questions.length,...rows.results.map(r=>questionsFor(r,current.questions).length));
+        const head=['ID','Имя','Фамилия','Имя в отчёте','Статус','Ответов','Баллы','Всего вопросов','Предупреждений','Регистрация UTC','Начало UTC','Окончание UTC','Последняя связь UTC','Время в секундах','Текущий вопрос','Причина',...Array.from({length:maxQuestions},(_,i)=>[`Вопрос ${i+1}: текст`,`Вопрос ${i+1}: ответ`,`Вопрос ${i+1}: верно`]).flat()];
         const date=(v:number|null)=>v?new Date(v).toISOString():'';
-        const lines=rows.results.map(r=>{const s=summary(r);return [r.id,r.first_name,r.last_name,r.label,r.status,s.answered,r.score,date(r.joined_at),date(r.started_at),date(r.finished_at),date(r.last_seen_at),s.duration_ms===null?'':Math.round(s.duration_ms/1000),r.current_question+1,r.reason,...questions.flatMap((q,i)=>[s.answers[i]===undefined?'':q.o[s.answers[i]],s.answers[i]===undefined?'':s.answers[i]===q.a?'Да':'Нет'])].map(csvCell).join(';')});
+        const lines=rows.results.map(r=>{const s=summary(r,current.questions),questions=questionsFor(r,current.questions);return [r.id,r.first_name,r.last_name,r.label,r.status,s.answered,r.score,questions.length,s.warnings,date(r.joined_at),date(r.started_at),date(r.finished_at),date(r.last_seen_at),s.duration_ms===null?'':Math.round(s.duration_ms/1000),r.current_question+1,r.reason,...Array.from({length:maxQuestions},(_,i)=>{const q=questions[i];return q?[q.q,s.answers[i]===undefined?'':q.o[s.answers[i]],s.answers[i]===undefined?'':s.answers[i]===q.a?'Да':'Нет']:['','','']}).flat()].map(csvCell).join(';')});
         return new Response('\uFEFF'+[head.map(csvCell).join(';'),...lines].join('\r\n'),{headers:{...headers,'Content-Type':'text/csv; charset=utf-8','Content-Disposition':'attachment; filename="codegate-report.csv"'}});
       }
       return send(404,{error:'Не найдено'});
@@ -100,30 +123,37 @@ export async function handleQuiz(request:Request,env:Cloudflare.Env):Promise<Res
     if(!row||!row.first_name)return send(401,{error:'Введите имя и фамилию'});
     if(row.browser!==browser)return send(403,{error:'Сессия привязана к другому браузеру'});
     if(row.status==='banned')return send(423,{error:row.reason||'Попытка заблокирована',banned:true});
-    if(path==='/api/state')return send(200,{status:row.status,name:row.label,answers:JSON.parse(row.answers),score:row.score,currentQuestion:row.current_question,startedAt:row.started_at,questions:row.status==='active'?questions.map(({a,...q})=>q):[]});
+    const questions=questionsFor(row,row.status==='ready'?(await settings(db)).questions:defaultQuestions);
+    if(path==='/api/state')return send(200,{status:row.status,name:row.label,answers:JSON.parse(row.answers),score:row.score,currentQuestion:row.current_question,startedAt:row.started_at,questionCount:questions.length,warnings:Math.min(row.violation_count,WARNING_LIMIT),warningLimit:WARNING_LIMIT,questions:row.status==='active'?questions.map(({a,...q})=>q):[]});
     if(path==='/api/start'&&row.status==='ready'){
       const result=await db.batch([
         db.prepare("INSERT INTO attempt_events(invite_id,kind,created_at) SELECT id,'started',? FROM invites WHERE id=? AND status='ready'").bind(now,row.id),
-        db.prepare("UPDATE invites SET status='active',started_at=?,last_seen_at=? WHERE id=? AND status='ready' RETURNING id").bind(now,now,row.id),
+        db.prepare("UPDATE invites SET status='active',started_at=?,last_seen_at=?,question_snapshot=? WHERE id=? AND status='ready' RETURNING id").bind(now,now,JSON.stringify(questions),row.id),
       ]);return result[1].results.length?send(200,{ok:true}):send(409,{error:'Статус попытки изменился. Обновите страницу.'});
     }
-    if(path==='/api/ban'){
+    if(path==='/api/violation'||path==='/api/ban'){
       const reason=String(b.reason||'Уход из окна теста').slice(0,160);
-      await db.batch([
-        db.prepare("INSERT INTO attempt_events(invite_id,kind,detail,created_at) SELECT id,'banned',?,? FROM invites WHERE id=? AND status='active'").bind(JSON.stringify({reason}),now,row.id),
-        db.prepare("UPDATE invites SET status='banned',reason=?,finished_at=?,last_seen_at=? WHERE id=? AND status='active'").bind(reason,now,now,row.id),
-      ]);return send(200,{ok:true});
+      const eventId=typeof b.eventId==='string'?b.eventId:random(20);
+      if(!/^[a-zA-Z0-9-]{16,80}$/.test(eventId))return send(400,{error:'Некорректное событие'});
+      const key=row.id+':'+eventId;
+      const result=await db.batch([
+        db.prepare("UPDATE invites SET violation_count=violation_count+1,last_violation_at=?,last_violation_id=?,last_seen_at=?,status=CASE WHEN violation_count>=? THEN 'banned' ELSE status END,reason=CASE WHEN violation_count>=? THEN ? ELSE reason END,finished_at=CASE WHEN violation_count>=? THEN ? ELSE finished_at END WHERE id=? AND status='active' AND (last_violation_at IS NULL OR last_violation_at<=?) AND NOT EXISTS(SELECT 1 FROM attempt_events WHERE event_key=?)").bind(now,key,now,WARNING_LIMIT,WARNING_LIMIT,reason,WARNING_LIMIT,now,row.id,now-2000,key),
+        db.prepare("INSERT INTO attempt_events(invite_id,kind,detail,created_at,event_key) SELECT id,CASE WHEN status='banned' THEN 'banned' ELSE 'warning' END,json_object('reason',?,'number',violation_count),?,? FROM invites WHERE id=? AND last_violation_id=? AND NOT EXISTS(SELECT 1 FROM attempt_events WHERE event_key=?)").bind(reason,now,key,row.id,key,key),
+        db.prepare('SELECT status,violation_count,reason FROM invites WHERE id=?').bind(row.id),
+      ]);
+      const updated=result[2].results[0] as {status:string;violation_count:number;reason:string|null};
+      return send(200,{ok:true,banned:updated.status==='banned',warnings:Math.min(updated.violation_count,WARNING_LIMIT),warningLimit:WARNING_LIMIT,error:updated.status==='banned'?updated.reason:undefined,reason});
     }
     if(row.status!=='active')return send(409,{error:'Попытка не активна'});
     if(path==='/api/progress'){
-      if(!Number.isInteger(b.index)||Number(b.index)<0||Number(b.index)>4)return send(400,{error:'Некорректный вопрос'});
+      if(!Number.isInteger(b.index)||Number(b.index)<0||Number(b.index)>=questions.length)return send(400,{error:'Некорректный вопрос'});
       await db.batch([
         db.prepare("INSERT INTO attempt_events(invite_id,kind,detail,created_at) SELECT id,'question',?,? FROM invites WHERE id=? AND status='active' AND current_question!=?").bind(JSON.stringify({index:b.index}),now,row.id,b.index),
         db.prepare("UPDATE invites SET current_question=?,last_seen_at=? WHERE id=? AND status='active'").bind(b.index,now,row.id),
       ]);return send(200,{ok:true});
     }
     if(path==='/api/answer'){
-      if(!Number.isInteger(b.index)||Number(b.index)<0||Number(b.index)>4||!Number.isInteger(b.answer)||Number(b.answer)<0||Number(b.answer)>3)return send(400,{error:'Некорректный ответ'});
+      if(!Number.isInteger(b.index)||Number(b.index)<0||Number(b.index)>=questions.length||!Number.isInteger(b.answer)||Number(b.answer)<0||Number(b.answer)>=questions[Number(b.index)].o.length)return send(400,{error:'Некорректный ответ'});
       const result=await db.batch([
         db.prepare("INSERT INTO attempt_events(invite_id,kind,detail,created_at) SELECT id,'answer',?,? FROM invites WHERE id=? AND status='active'").bind(JSON.stringify({index:b.index,answer:b.answer}),now,row.id),
         db.prepare("UPDATE invites SET answers=json_set(answers,?,CAST(? AS INTEGER)),last_seen_at=?,current_question=? WHERE id=? AND status='active' RETURNING id").bind(`$."${b.index}"`,b.answer,now,b.index,row.id),
