@@ -25,6 +25,11 @@ export const invites = sqliteTable('invites', {
   violationCount: integer('violation_count').notNull().default(0),
   lastViolationId: text('last_violation_id'),
   lastViolationAt: integer('last_violation_at'),
+  ipAddress: text('ip_address'),
+  lastIpAddress: text('last_ip_address'),
+  lastUserAgent: text('last_user_agent'),
+  previousAttemptId: integer('previous_attempt_id'),
+  nextAttemptId: integer('next_attempt_id'),
 }, table => [index('invites_browser_index').on(table.browser)]);
 
 export const attemptEvents = sqliteTable('attempt_events', {

@@ -13,7 +13,7 @@ function fixture(){
    if(file.startsWith('0000'))sql.prepare("INSERT INTO invites(hash,label,status,browser) VALUES('legacy','Старый участник','ready','browser-1')").run();
  }
  const db={withSession(){return this},prepare(query){let args=[];return {bind(...v){args=v;return this},_all(){return sql.prepare(query).all(...args)},async first(){return sql.prepare(query).get(...args)||null},async run(){return sql.prepare(query).run(...args)},async all(){return {results:this._all()}}}},async batch(statements){sql.exec('BEGIN');try{const r=statements.map(s=>({results:s._all(),success:true}));sql.exec('COMMIT');return r}catch(e){sql.exec('ROLLBACK');throw e}}};
- const call=async(path,data={},cookie='',admin=false,browser='browser-1',origin)=>{const req=new Request('https://quiz.example/api/'+path,{method:'POST',headers:{'Content-Type':'application/json',Cookie:cookie,...(admin?{'X-Admin-Key':'test-admin'}:{}),...(origin?{Origin:origin}:{})},body:JSON.stringify({browser,...data})});const res=await handleQuiz(req,{DB:db,ADMIN_KEY:'test-admin'});return {status:res.status,body:res.headers.get('Content-Type')?.includes('text/csv')?await res.text():await res.json(),cookie:res.headers.get('Set-Cookie')?.split(';')[0],headers:res.headers}};
+ const call=async(path,data={},cookie='',admin=false,browser='browser-1',origin,extraHeaders={})=>{const req=new Request('https://quiz.example/api/'+path,{method:'POST',headers:{'Content-Type':'application/json',Cookie:cookie,...(admin?{'X-Admin-Key':'test-admin'}:{}),...(origin?{Origin:origin}:{}),...extraHeaders},body:JSON.stringify({browser,...data})});const res=await handleQuiz(req,{DB:db,ADMIN_KEY:'test-admin'});return {status:res.status,body:res.headers.get('Content-Type')?.includes('text/csv')?await res.text():await res.json(),cookie:res.headers.get('Set-Cookie')?.split(';')[0],headers:res.headers}};
  return {sql,call};
 }
 test('name-only entry, session binding, atomic registration and validation',async()=>{
@@ -128,5 +128,50 @@ test('editable question counts, version conflicts and frozen attempts',async()=>
   const s2=(await call('state',{},login2.cookie,false,'browser-2')).body;assert.equal(s2.questionCount,1);assert.equal(s2.questions[0].q,newQuestion[0].q);
   await call('answer',{index:0,answer:0},login2.cookie,false,'browser-2');assert.equal((await call('finish',{},login2.cookie,false,'browser-2')).body.score,1);
   const csv=(await call('admin/export',{},'',true)).body;assert.match(csv,/Первый новый вопрос/);assert.match(csv,/Только один вопрос/);assert.match(csv,/Всего вопросов/);assert.match(csv,/Предупреждений/);
+ }finally{sql.close()}
+});
+
+test('admin unban resumes answers; retry creates separate history and reuses visitor session',async()=>{
+ const {sql,call}=fixture();try{
+  const login=await call('register',{firstName:'Тест',lastName:'Повторный'}),cookie=login.cookie;
+  const id=(await call('admin/list',{},'',true)).body.rows[0].id;
+  await call('start',{},cookie);await call('answer',{index:0,answer:1},cookie);
+  await call('violation',{eventId:crypto.randomUUID(),reason:'Фокус'},cookie);
+  await call('admin/revoke',{id},'',true);
+  assert.equal((await call('admin/unban',{id})).status,403);
+  assert.equal((await call('admin/unban',{id},'',true)).status,200);
+  const resumed=(await call('state',{},cookie)).body;
+  assert.equal(resumed.status,'active');assert.equal(resumed.answers[0],1);assert.equal(resumed.warnings,0);
+  assert.equal((await call('admin/unban',{id},'',true)).status,409);
+  assert.equal((await call('admin/retry',{id},'',true)).status,409);
+  await call('admin/revoke',{id},'',true);
+  const retries=await Promise.all([call('admin/retry',{id},'',true),call('admin/retry',{id},'',true)]);
+  assert.deepEqual(retries.map(r=>r.status).sort(),[200,409]);
+  const nextId=retries.find(r=>r.status===200).body.id;assert.notEqual(nextId,id);
+  const state=(await call('state',{},cookie)).body;assert.equal(state.status,'ready');assert.deepEqual(state.answers,{});assert.equal(state.warnings,0);
+  const old=(await call('admin/report',{id},'',true)).body;
+  assert.equal(old.participant.answers[0],1);assert.equal(old.participant.status,'banned');assert.equal(old.participant.next_attempt_id,nextId);
+  assert.ok(old.events.some(e=>e.kind==='admin_unban'));assert.ok(old.events.some(e=>e.kind==='retry_granted'));
+  assert.equal((await call('admin/unban',{id},'',true)).status,409);
+  const report=(await call('admin/report',{id:nextId},'',true)).body;assert.equal(report.participant.previous_attempt_id,id);
+  await call('start',{},cookie);assert.equal((await call('answer',{index:0,answer:0},cookie)).status,200);
+  assert.equal((await call('admin/report',{id},'',true)).body.participant.answers[0],1);
+ }finally{sql.close()}
+});
+
+test('IP and device information are captured from request metadata and restricted to admin',async()=>{
+ const {sql,call}=fixture();try{
+  const first={'CF-Connecting-IP':'203.0.113.20','User-Agent':'Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/120.0 Mobile Safari/537.36'};
+  const last={'CF-Connecting-IP':'2001:db8::42','User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0 Safari/537.36'};
+  const login=await call('register',{firstName:'Проверка',lastName:'Устройства'},'',false,'browser-1',undefined,first);
+  const state=await call('state',{},login.cookie,false,'browser-1',undefined,last);
+  assert.equal(state.status,200);assert.equal(state.body.ip_address,undefined);
+  const row=(await call('admin/list',{},'',true)).body.rows[0];
+  assert.equal(row.ip_address,'203.0.113.20');assert.equal(row.last_ip_address,'2001:db8::42');assert.match(row.device,/Телефон.*Android.*Chrome/);assert.match(row.last_device,/Windows/);
+  assert.equal((await call('admin/report',{id:row.id})).status,403);
+  const csv=(await call('admin/export',{},'',true)).body;assert.match(csv,/203\.0\.113\.20/);assert.match(csv,/Последний IP/);
+  // Missing trusted IP headers must not turn a user-supplied X-Forwarded-For into evidence.
+  await call('state',{},login.cookie,false,'browser-1',undefined,{'X-Forwarded-For':'192.0.2.99'});
+  assert.equal((await call('admin/report',{id:row.id},'',true)).body.participant.last_ip_address,'2001:db8::42');
  }finally{sql.close()}
 });
